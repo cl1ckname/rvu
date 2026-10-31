@@ -24,6 +24,11 @@ impl LocalRepo {
         Ok(Self { repo, workdir })
     }
 
+    /// Root of the working tree; diff paths are relative to it.
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
+    }
+
     /// Working tree vs index, like `git diff`.
     pub fn working_tree_diff(&self, context_lines: u32) -> anyhow::Result<Changeset> {
         let mut opts = DiffOptions::new();

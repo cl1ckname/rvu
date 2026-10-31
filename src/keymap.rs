@@ -7,6 +7,7 @@ pub enum Action {
     Quit,
     ToggleHelp,
     ToggleMode,
+    Comment,
     ToggleFold,
     FoldAll,
     UnfoldAll,
@@ -42,6 +43,7 @@ impl Action {
             Self::Quit => "quit",
             Self::ToggleHelp => "show / hide this cheatsheet",
             Self::ToggleMode => "switch mode: scroll / page",
+            Self::Comment => "comment the line (written into the file)",
             Self::ToggleFold => "page: hide / show unchanged lines",
             Self::FoldAll => "page: hide unchanged lines",
             Self::UnfoldAll => "page: show unchanged lines",
@@ -96,6 +98,7 @@ pub const HELP_SECTIONS: &[(&str, &[Action])] = &[
     (
         "Review",
         &[
+            Action::Comment,
             Action::NextChange,
             Action::PrevChange,
             Action::NextFile,
@@ -165,6 +168,7 @@ pub const DEFAULT_BINDINGS: &[(&str, Action)] = &[
     ("l", Action::Open),
     ("<CR>", Action::Open),
     ("h", Action::Close),
+    ("c", Action::Comment),
     ("<Space>m", Action::ToggleMode),
     ("zi", Action::ToggleFold),
     ("zM", Action::FoldAll),

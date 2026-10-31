@@ -20,6 +20,7 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 two-face = "0.5.2"
+unicode-width = "0.2"
 
 # Optimize dependencies (syntect, git2, ...) even in dev builds:
 # our code compiles fast, deps run at release speed.

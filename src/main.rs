@@ -1,7 +1,9 @@
 mod app;
 mod cli;
+mod comment;
 mod config;
 mod highlight;
+mod input;
 mod keymap;
 mod logging;
 mod model;

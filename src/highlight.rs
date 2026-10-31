@@ -58,6 +58,12 @@ impl Highlighter {
         Some(out)
     }
 
+    /// Name of the syntax detected for the file (e.g. "Rust"), the same
+    /// detection as for highlighting: extension, file name, first line.
+    pub fn syntax_name(&self, path: &Path, text: &str) -> Option<&str> {
+        self.detect(path, text).map(|s| s.name.as_str())
+    }
+
     fn detect(&self, path: &Path, text: &str) -> Option<&SyntaxReference> {
         let by_ext = path
             .extension()

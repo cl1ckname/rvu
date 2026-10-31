@@ -6,6 +6,10 @@
 
 Основная цель — self-hosted GitLab, авторизация по Personal Access Token.
 
+**Поддерживаемые версии: GitLab 15.7+.** С этой версии есть
+`/merge_requests/:iid/diffs`; устаревший `/changes` (обрезает большие MR)
+не используем и запасной вариант для старых версий не делаем.
+
 ## Решение
 
 Свой тонкий клиент на `reqwest` + `serde` (готовый крейт `gitlab` избыточен,
@@ -14,7 +18,7 @@
 | Задача                  | Эндпоинт |
 |-------------------------|----------|
 | MR, `diff_refs`         | `GET /projects/:id/merge_requests/:iid` |
-| Дифф файлов             | `GET /projects/:id/merge_requests/:iid/diffs` (пагинация; на старых версиях — `/changes`) |
+| Дифф файлов             | `GET /projects/:id/merge_requests/:iid/diffs` (пагинация) |
 | Полная версия файла     | `GET /projects/:id/repository/files/:path/raw?ref=<sha>` |
 | Инлайн-комментарий      | `POST /projects/:id/merge_requests/:iid/discussions` с `position` |
 

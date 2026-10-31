@@ -7,7 +7,9 @@ use ratatui::widgets::Widget;
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::cli::Target;
-use crate::config::{Config, ViewMode};
+use crate::comment;
+use crate::config::{CommentSyntax, Config, ViewMode};
+use crate::input::{InputResult, LineEditor};
 use crate::highlight::{HighlightCache, Highlighter};
 use crate::keymap::{Action, DEFAULT_BINDINGS, Keymap};
 use crate::model::{Changeset, LineKind, Side};
@@ -24,6 +26,18 @@ enum Focus {
 
 /// Cursor position remembered across reloads: file path + (old, new) line numbers.
 type Anchor = (std::path::PathBuf, Option<(Option<u32>, Option<u32>)>);
+
+/// Comment being typed in the input line.
+struct CommentDraft {
+    editor: LineEditor,
+    file: usize,
+    /// Path relative to the repository root.
+    path: std::path::PathBuf,
+    /// The comment is inserted before this line of the new version (1-based).
+    before: u32,
+    indent: String,
+    syntax: CommentSyntax,
+}
 
 enum Message {
     Info(String),
@@ -48,6 +62,7 @@ pub struct App {
     /// Page mode: unchanged regions are folded.
     fold: bool,
     message: Option<Message>,
+    comment: Option<CommentDraft>,
     show_tree: bool,
     show_help: bool,
     help_scroll: usize,
@@ -87,6 +102,7 @@ impl App {
             page_file: 0,
             fold,
             message,
+            comment: None,
             show_tree,
             show_help: false,
             help_scroll: 0,
@@ -220,6 +236,14 @@ impl App {
             return;
         }
         self.message = None;
+        if let Some(draft) = &mut self.comment {
+            match draft.editor.handle(key) {
+                InputResult::Continue => {}
+                InputResult::Cancel => self.comment = None,
+                InputResult::Submit => self.submit_comment(),
+            }
+            return;
+        }
         if let Some((action, count)) = self.keymap.feed(key) {
             self.dispatch(action, count);
         }
@@ -250,6 +274,7 @@ impl App {
                 self.help_scroll = 0;
             }
             Action::ToggleMode => self.toggle_mode(),
+            Action::Comment => self.start_comment(),
             Action::ToggleFold => self.set_fold(!self.fold),
             Action::FoldAll => self.set_fold(true),
             Action::UnfoldAll => self.set_fold(false),
@@ -285,6 +310,85 @@ impl App {
             && let Some(file) = self.view.current_file()
         {
             self.tree.select_file(file);
+        }
+    }
+
+    fn error(&mut self, msg: impl Into<String>) {
+        self.message = Some(Message::Error(msg.into()));
+    }
+
+    /// `c`: opens the input line for a comment on the cursor line.
+    fn start_comment(&mut self) {
+        if self.repo.is_none() {
+            return self.error("Comments in merge requests are not supported yet");
+        }
+        let cs = &self.changeset;
+        let (file, before, line_text) = match self.view.current() {
+            Some(Row::Code { file, hunk, line }) => {
+                let h = &cs.files[file].hunks[hunk];
+                let l = &h.lines[line];
+                // A removed line no longer exists: insert where it used to be,
+                // i.e. before the next line of the new version.
+                let before = l.new_lineno.unwrap_or_else(|| {
+                    h.lines[line + 1..].iter().find_map(|l| l.new_lineno).unwrap_or_else(|| {
+                        let new_before = if h.new_len == 0 { h.new_start } else { h.new_start.saturating_sub(1) };
+                        new_before + h.new_len + 1
+                    })
+                });
+                (file, before, l.content.as_str())
+            }
+            Some(Row::FileLine { file, new, .. }) => {
+                let text = cs.files[file].new_content.as_ref().and_then(|t| t.line(new)).unwrap_or("");
+                (file, new, text)
+            }
+            _ => return self.error("Put the cursor on a code line to comment it"),
+        };
+        let f = &cs.files[file];
+        let (Some(path), Some(content)) = (&f.new_path, &f.new_content) else {
+            return self.error("Cannot comment a deleted file");
+        };
+        let syntax_name = self.highlighter.syntax_name(path, content.as_str());
+        let Some(syntax) = comment::syntax_for(&self.config.comments, path, syntax_name) else {
+            let key = path
+                .extension()
+                .or(path.file_name())
+                .map(|k| k.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let kind = syntax_name.unwrap_or("unknown file type");
+            return self.error(format!(
+                "No comment syntax for {kind}: set [comments.syntax] {key} = \"...\" in config"
+            ));
+        };
+        self.comment = Some(CommentDraft {
+            editor: LineEditor::default(),
+            file,
+            path: path.clone(),
+            before,
+            indent: comment::indent_of(line_text).to_owned(),
+            syntax,
+        });
+        self.focus = Focus::Diff;
+    }
+
+    fn submit_comment(&mut self) {
+        let Some(draft) = self.comment.take() else { return };
+        let Some(repo) = &self.repo else { return };
+        let text = draft.editor.text();
+        if text.trim().is_empty() {
+            return;
+        }
+        let line = comment::format_line(&draft.syntax, &draft.indent, text.trim_end());
+        let snapshot = self.changeset.files[draft.file].new_content.as_ref().map(|t| t.as_str()).unwrap_or("");
+        let abs = repo.workdir().join(&draft.path);
+        if let Err(e) = comment::write_comment(&abs, snapshot, draft.before, &line) {
+            return self.error(format!("{e:#}"));
+        }
+        self.refresh();
+        // Put the cursor on the new comment line.
+        self.goto_anchor(Some((draft.path.clone(), Some((None, Some(draft.before))))));
+        if !matches!(self.message, Some(Message::Error(_))) {
+            let msg = format!("Comment added: {}:{}", draft.path.display(), draft.before);
+            self.message = Some(Message::Info(msg));
         }
     }
 
@@ -471,7 +575,47 @@ impl App {
         ])
     }
 
+    /// Input line for a comment, in place of the status bar.
+    fn draw_comment_input(&self, frame: &mut Frame, area: Rect, draft: &CommentDraft) {
+        let label = Span::from(" COMMENT ").bold().black().on_light_yellow();
+        let location = format!(" {}:{} ", draft.path.display(), draft.before);
+        let prefix = comment::prompt_prefix(&draft.syntax);
+        let suffix = match &draft.syntax {
+            CommentSyntax::Block([_, end]) => format!(" {end}"),
+            CommentSyntax::Line(_) => String::new(),
+        };
+        let fixed = 9 + location.chars().count() + prefix.chars().count();
+        let avail = (area.width as usize).saturating_sub(fixed + 1).max(1);
+
+        // Scroll the text horizontally so that the cursor stays visible.
+        let text = draft.editor.text();
+        let cursor = draft.editor.cursor_width();
+        let skip = cursor.saturating_sub(avail - 1);
+        let mut shown = String::new();
+        let mut width = 0;
+        for c in text.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if width >= skip {
+                shown.push(c);
+            }
+            width += w;
+        }
+        let line = Line::from(vec![
+            label,
+            Span::from(location).dim(),
+            Span::from(prefix).dim(),
+            Span::from(shown),
+            Span::from(suffix).dim(),
+        ]);
+        frame.render_widget(line, area);
+        let x = area.x + (fixed + cursor - skip) as u16;
+        frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
+    }
+
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
+        if let Some(draft) = &self.comment {
+            return self.draw_comment_input(frame, area, draft);
+        }
         let fold = if self.mode == ViewMode::Page && self.fold { "·FOLD" } else { "" };
         let mode = format!(" {:?}{fold} ", self.mode).to_uppercase();
         let mut left = vec![Span::from(mode).bold().reversed(), " ".into()];
