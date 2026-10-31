@@ -1,0 +1,48 @@
+# rvu configuration.
+# Location: $XDG_CONFIG_HOME/rvu/config.toml (~/.config/rvu/config.toml).
+# Every setting is optional; the values below are the defaults.
+# Full reference: docs/config.md in the rvu repository.
+
+[ui]
+# View mode on startup: "scroll" (all files, like `git diff`)
+# or "page" (one whole file with highlighted changes).
+default_mode = "scroll"
+
+# Syntax highlighting theme. Any bat theme works, e.g.
+# "base16-ocean.dark", "Catppuccin Mocha", "gruvbox-dark", "Nord",
+# "OneHalfDark", "TwoDark", "Dracula", "Monokai Extended".
+# An unknown name makes rvu print the full list.
+theme = "base16-ocean.dark"
+
+# Show the file tree on startup. Toggle at runtime with Ctrl-b.
+show_tree = true
+
+# Width of the file tree panel, in columns.
+tree_width = 30
+
+# Unchanged lines shown around each change in Scroll mode.
+context_lines = 3
+
+[page]
+# Hide unchanged regions in Page mode on startup.
+# Toggle at runtime with `zi`; `zM` folds, `zR` unfolds.
+fold_unchanged = false
+
+# Unchanged lines kept visible above and below each change when folded.
+fold_context = 5
+
+# Comment syntax overrides by file extension (for local comments).
+# A string is a line comment, a pair of strings is a block comment.
+[comments.syntax]
+# rs = "//"
+# sql = "--"
+# vue = ["<!--", "-->"]
+
+# GitLab instances; the one matching the merge request URL host is used.
+# The token needs the `api` scope. Set exactly one of token / token_env / token_command.
+#
+# [[gitlab]]
+# host = "gitlab.example.com"
+# token_env = "RVU_GITLAB_TOKEN"                      # read from env variable
+# token_command = "pass show work/gitlab-token"       # stdout of a command
+# token = "glpat-..."                                 # plain text (not recommended)
