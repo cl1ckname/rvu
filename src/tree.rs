@@ -192,6 +192,7 @@ mod tests {
                     new_path: Some(p.into()),
                     status: FileStatus::Modified,
                     binary: false,
+                    too_large: false,
                     hunks: vec![],
                     old_content: None,
                     new_content: None,

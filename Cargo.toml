@@ -10,7 +10,9 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 dirs = "7.0.0"
 futures = "0.3.34"
 git2 = { version = "0.21.0", default-features = false }
+percent-encoding = "2.3.2"
 ratatui = "0.30.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "query", "system-proxy", "http2"] }
 serde = { version = "1.0.229", features = ["derive"] }
 syntect = "5.3.0"
 thiserror = "2.0.21"
@@ -21,6 +23,7 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 two-face = "0.5.2"
 unicode-width = "0.2"
+url = "2.5.8"
 
 # Optimize dependencies (syntect, git2, ...) even in dev builds:
 # our code compiles fast, deps run at release speed.
@@ -28,4 +31,6 @@ unicode-width = "0.2"
 opt-level = 3
 
 [dev-dependencies]
+serde_json = "1.0.154"
 tempfile = "3.27.0"
+wiremock = "0.6.5"

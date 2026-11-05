@@ -6,14 +6,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::cli::Target;
+use std::sync::Arc;
+
+use tokio::sync::{Semaphore, mpsc};
+
 use crate::comment;
 use crate::config::{CommentSyntax, Config, ViewMode};
 use crate::input::{InputResult, LineEditor};
 use crate::highlight::{HighlightCache, Highlighter};
 use crate::keymap::{Action, DEFAULT_BINDINGS, Keymap};
-use crate::model::{Changeset, LineKind, Side};
-use crate::source::local::LocalRepo;
+use crate::model::{Changeset, LineKind, Side, Text};
+use crate::source::Source;
+use crate::source::gitlab::{ContentRequest, MrInfo, content_requests};
 use crate::tree::{FileTree, ItemKind};
 use crate::ui;
 use crate::view::{DiffView, Row};
@@ -39,6 +43,17 @@ struct CommentDraft {
     syntax: CommentSyntax,
 }
 
+/// Results of background work, delivered to the event loop.
+enum BgEvent {
+    /// One file version of a merge request has been fetched.
+    Content { generation: u64, req: ContentRequest, result: anyhow::Result<Option<Text>> },
+    /// Merge request reloaded (`R`).
+    Reloaded(anyhow::Result<(MrInfo, Changeset)>),
+}
+
+/// How many file versions are fetched from GitLab in parallel.
+const FETCH_CONCURRENCY: usize = 8;
+
 enum Message {
     Info(String),
     Error(String),
@@ -46,8 +61,7 @@ enum Message {
 
 pub struct App {
     config: Config,
-    target: Target,
-    repo: Option<LocalRepo>,
+    source: Source,
     changeset: Changeset,
     view: DiffView,
     tree: FileTree,
@@ -67,29 +81,23 @@ pub struct App {
     show_help: bool,
     help_scroll: usize,
     should_quit: bool,
+    bg_tx: mpsc::UnboundedSender<BgEvent>,
+    bg_rx: Option<mpsc::UnboundedReceiver<BgEvent>>,
+    /// Bumped on every (re)load: results of older fetches are dropped.
+    generation: u64,
+    /// File versions still being fetched.
+    loading: usize,
 }
 
 impl App {
-    pub fn new(
-        config: Config,
-        target: Target,
-        repo: Option<LocalRepo>,
-        changeset: Changeset,
-        highlighter: Highlighter,
-    ) -> Self {
-        let message = match target {
-            Target::GitLabMr { .. } => {
-                Some(Message::Error("GitLab merge requests are not supported yet".into()))
-            }
-            Target::WorkingTree => None,
-        };
+    pub fn new(config: Config, source: Source, changeset: Changeset, highlighter: Highlighter) -> Self {
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let mode = config.ui.default_mode;
         let fold = config.page.fold_unchanged;
         let show_tree = config.ui.show_tree;
         let mut app = Self {
             config,
-            target,
-            repo,
+            source,
             changeset: Changeset::default(),
             view: DiffView::default(),
             tree: FileTree::default(),
@@ -101,12 +109,16 @@ impl App {
             mode,
             page_file: 0,
             fold,
-            message,
+            message: None,
             comment: None,
             show_tree,
             show_help: false,
             help_scroll: 0,
             should_quit: false,
+            bg_tx,
+            bg_rx: Some(bg_rx),
+            generation: 0,
+            loading: 0,
         };
         app.set_changeset(changeset);
         app
@@ -114,15 +126,89 @@ impl App {
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> anyhow::Result<()> {
         let mut events = EventStream::new();
+        let mut bg = self.bg_rx.take().expect("App::run called twice");
+        self.start_content_loading();
         while !self.should_quit {
             terminal.draw(|f| self.draw(f))?;
-            match events.next().await {
-                Some(Ok(event)) => self.handle_event(event),
-                Some(Err(e)) => return Err(e.into()),
-                None => break,
+            tokio::select! {
+                event = events.next() => match event {
+                    Some(Ok(event)) => self.handle_event(event),
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                },
+                Some(event) = bg.recv() => self.handle_bg(event),
             }
         }
         Ok(())
+    }
+
+    /// Merge requests: fetches full file versions in the background
+    /// (for highlighting and Page mode); the diff is usable meanwhile.
+    fn start_content_loading(&mut self) {
+        let Source::MergeRequest { source, info } = &self.source else { return };
+        self.generation += 1;
+        let requests = content_requests(&self.changeset, &info.refs);
+        self.loading = requests.len();
+        let limit = Arc::new(Semaphore::new(FETCH_CONCURRENCY));
+        for req in requests {
+            let (source, tx, limit, generation) = (source.clone(), self.bg_tx.clone(), limit.clone(), self.generation);
+            tokio::spawn(async move {
+                let _permit = limit.acquire_owned().await;
+                let result = source.content(&req).await;
+                let _ = tx.send(BgEvent::Content { generation, req, result });
+            });
+        }
+    }
+
+    fn handle_bg(&mut self, event: BgEvent) {
+        match event {
+            BgEvent::Content { generation, .. } if generation != self.generation => {}
+            BgEvent::Content { req, result, .. } => {
+                self.loading = self.loading.saturating_sub(1);
+                match result {
+                    Ok(Some(text)) => self.set_content(&req.path, req.side, text),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(path = %req.path.display(), "cannot fetch file: {e:#}");
+                        if self.message.is_none() {
+                            self.error(format!("Cannot load {}: {e:#}", req.path.display()));
+                        }
+                    }
+                }
+            }
+            BgEvent::Reloaded(Ok((info, cs))) => {
+                if let Source::MergeRequest { info: current, .. } = &mut self.source {
+                    *current = info;
+                }
+                let n = cs.files.len();
+                self.apply_reloaded(cs);
+                self.start_content_loading();
+                self.message = Some(Message::Info(format!("Reloaded: {n} files changed")));
+            }
+            BgEvent::Reloaded(Err(e)) => self.error(format!("Reload failed: {e:#}")),
+        }
+    }
+
+    fn set_content(&mut self, path: &std::path::Path, side: Side, text: Text) {
+        let Some(file) = self.changeset.files.iter().position(|f| match side {
+            Side::Old => f.old_path.as_deref() == Some(path),
+            Side::New => f.new_path.as_deref() == Some(path),
+        }) else {
+            return;
+        };
+        let f = &mut self.changeset.files[file];
+        match side {
+            Side::Old => f.old_content = Some(text),
+            Side::New => f.new_content = Some(text),
+        }
+        self.highlights.invalidate(file, side);
+        // Page mode shows the whole file only once the new version is known.
+        if self.mode == ViewMode::Page && self.page_file == file && side == Side::New {
+            let (anchor, offset) = (self.anchor(), self.view.offset);
+            self.rebuild_view();
+            self.view.offset = offset;
+            self.goto_anchor(anchor);
+        }
     }
 
     fn set_changeset(&mut self, mut changeset: Changeset) {
@@ -319,8 +405,8 @@ impl App {
 
     /// `c`: opens the input line for a comment on the cursor line.
     fn start_comment(&mut self) {
-        if self.repo.is_none() {
-            return self.error("Comments in merge requests are not supported yet");
+        if !matches!(self.source, Source::Local(_)) {
+            return self.error("Comments in merge requests are not supported yet (M5)");
         }
         let cs = &self.changeset;
         let (file, before, line_text) = match self.view.current() {
@@ -372,7 +458,7 @@ impl App {
 
     fn submit_comment(&mut self) {
         let Some(draft) = self.comment.take() else { return };
-        let Some(repo) = &self.repo else { return };
+        let Source::Local(repo) = &self.source else { return };
         let text = draft.editor.text();
         if text.trim().is_empty() {
             return;
@@ -483,21 +569,33 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        let Some(repo) = &self.repo else { return };
+        match &self.source {
+            Source::Local(repo) => match repo.working_tree_diff(self.config.ui.context_lines) {
+                Ok(cs) => {
+                    let n = cs.files.len();
+                    self.apply_reloaded(cs);
+                    self.message = Some(Message::Info(format!("Reloaded: {n} files changed")));
+                }
+                Err(e) => self.error(format!("Reload failed: {e:#}")),
+            },
+            Source::MergeRequest { source, .. } => {
+                let (source, tx) = (source.clone(), self.bg_tx.clone());
+                tokio::spawn(async move {
+                    let _ = tx.send(BgEvent::Reloaded(source.load().await));
+                });
+                self.message = Some(Message::Info("Reloading merge request…".into()));
+            }
+        }
+    }
+
+    /// Replaces the changeset keeping the cursor on the same line if possible.
+    fn apply_reloaded(&mut self, cs: Changeset) {
         let anchor = self.anchor();
         let (offset, cursor) = (self.view.offset, self.view.cursor);
-
-        match repo.working_tree_diff(self.config.ui.context_lines) {
-            Ok(cs) => {
-                let n = cs.files.len();
-                self.set_changeset(cs);
-                self.view.offset = offset;
-                if !self.goto_anchor(anchor) {
-                    self.view.goto(cursor);
-                }
-                self.message = Some(Message::Info(format!("Reloaded: {n} files changed")));
-            }
-            Err(e) => self.message = Some(Message::Error(format!("Reload failed: {e:#}"))),
+        self.set_changeset(cs);
+        self.view.offset = offset;
+        if !self.goto_anchor(anchor) {
+            self.view.goto(cursor);
         }
     }
 
@@ -562,17 +660,26 @@ impl App {
         let (added, removed) = (0..self.changeset.files.len())
             .map(|f| ui::file_stats(&self.changeset, f))
             .fold((0, 0), |(a, r), (fa, fr)| (a + fa, r + fr));
-        let target = match &self.target {
-            Target::WorkingTree => "working tree".to_owned(),
-            Target::GitLabMr { url } => url.clone(),
+        let mut spans: Vec<Span> = match &self.source {
+            Source::Local(_) => vec![" working tree ".into()],
+            Source::MergeRequest { info, .. } => vec![
+                format!(" !{} ", info.iid).bold(),
+                format!("{} ", info.title).into(),
+                format!("{} → {} ", info.source_branch, info.target_branch).dim(),
+                if info.state == "opened" { Span::default() } else { format!("[{}] ", info.state).dim() },
+                format!("@{} ", info.author).dim(),
+            ],
         };
-        Line::from(vec![
-            format!(" {target} ").into(),
+        spans.extend([
             Span::from(format!("+{added}")).fg(Color::Rgb(0x8f, 0xd1, 0x9e)),
             " ".into(),
             Span::from(format!("-{removed}")).fg(Color::Rgb(0xf0, 0x8a, 0x95)),
             " ".into(),
-        ])
+        ]);
+        if self.loading > 0 {
+            spans.push(format!("· loading {} files ", self.loading).dim().italic());
+        }
+        Line::from(spans)
     }
 
     /// Input line for a comment, in place of the status bar.

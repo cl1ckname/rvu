@@ -23,8 +23,8 @@
 | Инлайн-комментарий      | `POST /projects/:id/merge_requests/:iid/discussions` с `position` |
 
 `:id` — URL-encoded путь проекта из URL MR.
-TLS — `rustls` с системными сертификатами (корпоративные CA из системного
-хранилища подхватываются).
+TLS — `reqwest` 0.13 с фичей `rustls` (rustls-platform-verifier): проверка
+через системное хранилище, корпоративные CA подхватываются.
 
 ## Последствия
 

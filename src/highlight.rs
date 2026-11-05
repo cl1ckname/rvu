@@ -114,6 +114,11 @@ impl HighlightCache {
         self.files.clear();
     }
 
+    /// Forgets one file version, e.g. when its contents arrive later.
+    pub fn invalidate(&mut self, file: usize, side: Side) {
+        self.files.remove(&(file, side));
+    }
+
     pub fn ensure(&mut self, hl: &Highlighter, cs: &Changeset, file: usize, side: Side) {
         self.files.entry((file, side)).or_insert_with(|| {
             let f = &cs.files[file];

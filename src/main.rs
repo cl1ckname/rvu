@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod comment;
 mod config;
+mod gitlab;
 mod highlight;
 mod input;
 mod keymap;
@@ -14,8 +15,11 @@ mod view;
 
 use clap::Parser;
 
+use std::sync::Arc;
+
 use crate::cli::Target;
-use crate::model::Changeset;
+use crate::source::Source;
+use crate::source::gitlab::MergeRequestSource;
 use crate::source::local::LocalRepo;
 
 #[tokio::main]
@@ -29,18 +33,23 @@ async fn main() -> anyhow::Result<()> {
     let highlighter = highlight::Highlighter::new(&config.ui.theme)?;
 
     // Load before entering the TUI so that errors are printed normally.
-    let (repo, changeset) = match &target {
+    let (source, changeset) = match &target {
         Target::WorkingTree => {
             let repo = LocalRepo::discover(&std::env::current_dir()?)?;
             let cs = repo.working_tree_diff(config.ui.context_lines)?;
-            (Some(repo), cs)
+            (Source::Local(repo), cs)
         }
-        Target::GitLabMr { .. } => (None, Changeset::default()),
+        Target::GitLabMr { url } => {
+            let mr = MergeRequestSource::new(&config, url)?;
+            eprintln!("Loading {url} ...");
+            let (info, cs) = mr.load().await?;
+            (Source::MergeRequest { source: Arc::new(mr), info }, cs)
+        }
     };
 
     // ratatui::init installs a panic hook that restores the terminal.
     let terminal = ratatui::init();
-    let result = app::App::new(config, target, repo, changeset, highlighter).run(terminal).await;
+    let result = app::App::new(config, source, changeset, highlighter).run(terminal).await;
     ratatui::restore();
     result
 }

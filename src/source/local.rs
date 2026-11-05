@@ -114,7 +114,7 @@ impl LocalRepo {
             (old, new)
         };
 
-        Ok(FileDiff { old_path, new_path, status, binary, hunks, old_content, new_content })
+        Ok(FileDiff { old_path, new_path, status, binary, too_large: false, hunks, old_content, new_content })
     }
 }
 

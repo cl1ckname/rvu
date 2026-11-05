@@ -69,6 +69,8 @@ impl DiffView {
             rows.push(Row::FileHeader { file: fi });
             if f.binary {
                 rows.push(Row::Note { file: fi, text: "Binary file" });
+            } else if f.too_large {
+                rows.push(Row::Note { file: fi, text: "Diff is too large to display" });
             } else if f.hunks.is_empty() {
                 rows.push(Row::Note { file: fi, text: "No textual changes" });
             }
@@ -99,6 +101,8 @@ impl DiffView {
         let mut rows = vec![Row::FileHeader { file: fi }];
         if f.binary {
             rows.push(Row::Note { file: fi, text: "Binary file" });
+        } else if f.too_large {
+            rows.push(Row::Note { file: fi, text: "Diff is too large to display" });
         } else if f.hunks.is_empty() {
             rows.push(Row::Note { file: fi, text: "No textual changes" });
         }
@@ -417,6 +421,7 @@ mod tests {
             new_path: Some("a".into()),
             status: FileStatus::Modified,
             binary: false,
+            too_large: false,
             hunks: vec![Hunk {
                 header: "@@".into(),
                 old_start: 1,

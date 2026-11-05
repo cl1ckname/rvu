@@ -36,6 +36,8 @@ pub struct FileDiff {
     pub new_path: Option<PathBuf>,
     pub status: FileStatus,
     pub binary: bool,
+    /// The source refused to produce a diff (GitLab: file too large).
+    pub too_large: bool,
     pub hunks: Vec<Hunk>,
     /// Full old version of the file (for highlighting and Page mode).
     pub old_content: Option<Text>,
