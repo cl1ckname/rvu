@@ -34,9 +34,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Load before entering the TUI so that errors are printed normally.
     let (source, changeset) = match &target {
-        Target::WorkingTree => {
-            let repo = LocalRepo::discover(&std::env::current_dir()?)?;
-            let cs = repo.working_tree_diff(config.ui.context_lines)?;
+        Target::Local(spec) => {
+            let repo = LocalRepo::discover(&std::env::current_dir()?, spec.clone())?;
+            let cs = repo.diff(config.ui.context_lines)?;
             (Source::Local(repo), cs)
         }
         Target::GitLabMr { url } => {

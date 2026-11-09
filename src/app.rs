@@ -433,6 +433,17 @@ impl App {
         let (Some(path), Some(content)) = (&f.new_path, &f.new_content) else {
             return self.error("Cannot comment a deleted file");
         };
+        // Comments go into the working tree, so with a commit or the index on
+        // the new side the file there must be the same as the reviewed one.
+        if let Source::Local(repo) = &self.source
+            && !repo.spec().new_side_is_workdir()
+            && std::fs::read(repo.workdir().join(path)).ok().as_deref() != Some(content.as_str().as_bytes())
+        {
+            return self.error(format!(
+                "{} in the working tree differs from the reviewed version: comments are written there",
+                path.display()
+            ));
+        }
         let syntax_name = self.highlighter.syntax_name(path, content.as_str());
         let Some(syntax) = comment::syntax_for(&self.config.comments, path, syntax_name) else {
             let key = path
@@ -546,6 +557,9 @@ impl App {
             Action::Close => {
                 if t.is_selected_expanded_dir() {
                     t.set_expanded(Some(false));
+                } else if t.is_selected_top_level() {
+                    // Nowhere to go up: fold the whole tree to its top level.
+                    t.collapse_all();
                 } else {
                     t.select_parent();
                 }
@@ -570,7 +584,7 @@ impl App {
 
     fn refresh(&mut self) {
         match &self.source {
-            Source::Local(repo) => match repo.working_tree_diff(self.config.ui.context_lines) {
+            Source::Local(repo) => match repo.diff(self.config.ui.context_lines) {
                 Ok(cs) => {
                     let n = cs.files.len();
                     self.apply_reloaded(cs);
@@ -661,7 +675,7 @@ impl App {
             .map(|f| ui::file_stats(&self.changeset, f))
             .fold((0, 0), |(a, r), (fa, fr)| (a + fa, r + fr));
         let mut spans: Vec<Span> = match &self.source {
-            Source::Local(_) => vec![" working tree ".into()],
+            Source::Local(repo) => vec![format!(" {} ", repo.spec().label()).into()],
             Source::MergeRequest { info, .. } => vec![
                 format!(" !{} ", info.iid).bold(),
                 format!("{} ", info.title).into(),

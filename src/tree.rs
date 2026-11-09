@@ -134,6 +134,26 @@ impl FileTree {
         matches!(self.items[idx].kind, ItemKind::Dir { .. }) && !self.collapsed.contains(&idx)
     }
 
+    /// Collapses every directory, leaving only the top level visible.
+    /// The selection stays on the same item (it is top-level, or its
+    /// top-level ancestor gets selected).
+    pub fn collapse_all(&mut self) {
+        let selected = self.visible.get(self.selected).copied();
+        self.collapsed =
+            (0..self.items.len()).filter(|&i| matches!(self.items[i].kind, ItemKind::Dir { .. })).collect();
+        self.rebuild_visible();
+        if let Some(sel) = selected {
+            // The last visible item at or before the old selection is the
+            // selection itself or its top-level ancestor.
+            self.selected = self.visible.iter().rposition(|&i| i <= sel).unwrap_or(0);
+        }
+    }
+
+    /// Whether the selected item is at the top level of the tree.
+    pub fn is_selected_top_level(&self) -> bool {
+        self.selected_item().is_some_and(|i| i.depth == 0)
+    }
+
     /// Selects the parent directory of the current item.
     pub fn select_parent(&mut self) {
         let Some(&idx) = self.visible.get(self.selected) else { return };
@@ -227,5 +247,18 @@ mod tests {
         assert_eq!(t.selected, 2);
         t.select_parent();
         assert_eq!(t.selected, 1);
+    }
+
+    #[test]
+    fn collapse_all_keeps_top_level() {
+        let mut t = FileTree::new(&cs(&["src/ui/a.rs", "src/main.rs", "docs/x.md", "README.md"]));
+        t.select_file(3); // README.md
+        t.collapse_all();
+        assert_eq!(labels(&t), vec!["docs", "src", "README.md"]);
+        assert_eq!(t.selected_item().unwrap().label, "README.md");
+        // Nested directories are collapsed too.
+        t.selected = 1;
+        t.set_expanded(Some(true));
+        assert_eq!(labels(&t), vec!["docs", "src", " ui", " main.rs", "README.md"]);
     }
 }

@@ -2,26 +2,94 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
-use git2::{Delta, DiffOptions, Patch, Repository};
+use anyhow::{Context, bail};
+use git2::{Commit, Delta, DiffFindOptions, DiffOptions, ErrorCode, Patch, Repository, Tree};
 
 use crate::model::{Changeset, DiffLine, FileDiff, FileStatus, Hunk, LineKind, Text};
+
+/// What to compare, with the same meaning as the `git diff` arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffSpec {
+    /// `git diff`: index -> working tree.
+    WorkingTree,
+    /// `git diff --staged [<rev>]`: `<rev>` (default HEAD) -> index.
+    Staged { base: Option<String> },
+    /// `git diff <rev>`: `<rev>` -> working tree.
+    Rev(String),
+    /// `git diff A..B`: A -> B.
+    Range { from: String, to: String },
+    /// `git diff A...B`: merge-base(A, B) -> B.
+    MergeBase { from: String, to: String },
+    /// `git diff C^!`: the changes of commit C.
+    Commit(String),
+}
+
+impl DiffSpec {
+    /// Parses a revision argument; an omitted side of `..`/`...` is HEAD.
+    pub fn parse(arg: Option<&str>, staged: bool) -> anyhow::Result<Self> {
+        let or_head = |s: &str| if s.is_empty() { "HEAD".to_owned() } else { s.to_owned() };
+        let Some(arg) = arg else {
+            return Ok(if staged { Self::Staged { base: None } } else { Self::WorkingTree });
+        };
+        if arg.is_empty() {
+            bail!("empty revision");
+        }
+        let spec = if let Some((a, b)) = arg.split_once("...") {
+            Self::MergeBase { from: or_head(a), to: or_head(b) }
+        } else if let Some((a, b)) = arg.split_once("..") {
+            Self::Range { from: or_head(a), to: or_head(b) }
+        } else if let Some(c) = arg.strip_suffix("^!") {
+            Self::Commit(or_head(c))
+        } else if staged {
+            return Ok(Self::Staged { base: Some(arg.to_owned()) });
+        } else {
+            Self::Rev(arg.to_owned())
+        };
+        if staged {
+            bail!("--staged takes a single revision, not {arg:?}");
+        }
+        Ok(spec)
+    }
+
+    /// Whether the new side of the diff is the working tree itself.
+    pub fn new_side_is_workdir(&self) -> bool {
+        matches!(self, Self::WorkingTree | Self::Rev(_))
+    }
+
+    /// Short description for the title bar.
+    pub fn label(&self) -> String {
+        match self {
+            Self::WorkingTree => "working tree".into(),
+            Self::Staged { base: None } => "staged".into(),
+            Self::Staged { base: Some(b) } => format!("{b} → index"),
+            Self::Rev(r) => format!("{r} → working tree"),
+            Self::Range { from, to } => format!("{from}..{to}"),
+            Self::MergeBase { from, to } => format!("{from}...{to}"),
+            Self::Commit(c) => format!("commit {c}"),
+        }
+    }
+}
 
 pub struct LocalRepo {
     repo: Repository,
     workdir: PathBuf,
+    spec: DiffSpec,
 }
 
 impl LocalRepo {
     /// Finds the repository containing `path` (like `git` does).
-    pub fn discover(path: &Path) -> anyhow::Result<Self> {
+    pub fn discover(path: &Path, spec: DiffSpec) -> anyhow::Result<Self> {
         let repo = Repository::discover(path)
             .with_context(|| format!("{} is not inside a git repository", path.display()))?;
         let workdir = repo
             .workdir()
             .context("bare repositories are not supported")?
             .to_path_buf();
-        Ok(Self { repo, workdir })
+        Ok(Self { repo, workdir, spec })
+    }
+
+    pub fn spec(&self) -> &DiffSpec {
+        &self.spec
     }
 
     /// Root of the working tree; diff paths are relative to it.
@@ -29,11 +97,40 @@ impl LocalRepo {
         &self.workdir
     }
 
-    /// Working tree vs index, like `git diff`.
-    pub fn working_tree_diff(&self, context_lines: u32) -> anyhow::Result<Changeset> {
+    /// The diff described by the spec; revisions are resolved anew on every call.
+    pub fn diff(&self, context_lines: u32) -> anyhow::Result<Changeset> {
         let mut opts = DiffOptions::new();
         opts.context_lines(context_lines);
-        let diff = self.repo.diff_index_to_workdir(None, Some(&mut opts))?;
+        let opts = Some(&mut opts);
+        let repo = &self.repo;
+        let mut diff = match &self.spec {
+            DiffSpec::WorkingTree => repo.diff_index_to_workdir(None, opts)?,
+            DiffSpec::Staged { base } => {
+                let tree = match base {
+                    Some(rev) => Some(self.tree(rev)?),
+                    None => self.head_tree()?,
+                };
+                repo.diff_tree_to_index(tree.as_ref(), None, opts)?
+            }
+            DiffSpec::Rev(rev) => repo.diff_tree_to_workdir_with_index(Some(&self.tree(rev)?), opts)?,
+            DiffSpec::Range { from, to } => {
+                repo.diff_tree_to_tree(Some(&self.tree(from)?), Some(&self.tree(to)?), opts)?
+            }
+            DiffSpec::MergeBase { from, to } => {
+                let (a, b) = (self.commit(from)?, self.commit(to)?);
+                let base = repo
+                    .merge_base(a.id(), b.id())
+                    .with_context(|| format!("{from} and {to} have no common ancestor"))?;
+                repo.diff_tree_to_tree(Some(&repo.find_commit(base)?.tree()?), Some(&b.tree()?), opts)?
+            }
+            DiffSpec::Commit(rev) => {
+                let c = self.commit(rev)?;
+                // The root commit is compared with the empty tree.
+                let parent = c.parents().next().map(|p| p.tree()).transpose()?;
+                repo.diff_tree_to_tree(parent.as_ref(), Some(&c.tree()?), opts)?
+            }
+        };
+        diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
 
         let mut files = Vec::new();
         for idx in 0..diff.deltas().len() {
@@ -43,6 +140,35 @@ impl LocalRepo {
             files.push(self.file_diff(&patch)?);
         }
         Ok(Changeset { files })
+    }
+
+    fn object(&self, rev: &str) -> anyhow::Result<git2::Object<'_>> {
+        self.repo.revparse_single(rev).with_context(|| format!("unknown revision {rev:?}"))
+    }
+
+    fn tree(&self, rev: &str) -> anyhow::Result<Tree<'_>> {
+        self.object(rev)?.peel_to_tree().with_context(|| format!("{rev:?} is not a commit or tree"))
+    }
+
+    fn commit(&self, rev: &str) -> anyhow::Result<Commit<'_>> {
+        self.object(rev)?.peel_to_commit().with_context(|| format!("{rev:?} is not a commit"))
+    }
+
+    /// `None` before the first commit.
+    fn head_tree(&self) -> anyhow::Result<Option<Tree<'_>>> {
+        match self.repo.head() {
+            Ok(head) => Ok(Some(head.peel_to_tree()?)),
+            Err(e) if matches!(e.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn blob_text(&self, id: git2::Oid) -> anyhow::Result<Option<Text>> {
+        if id.is_zero() {
+            return Ok(None);
+        }
+        let blob = self.repo.find_blob(id)?;
+        Ok(Some(Text::from(String::from_utf8_lossy(blob.content()).into_owned())))
     }
 
     fn file_diff(&self, patch: &Patch) -> anyhow::Result<FileDiff> {
@@ -98,17 +224,14 @@ impl LocalRepo {
             (None, None)
         } else {
             let old = match &old_path {
-                Some(_) if !delta.old_file().id().is_zero() => {
-                    let blob = self.repo.find_blob(delta.old_file().id())?;
-                    Some(Text::from(String::from_utf8_lossy(blob.content()).into_owned()))
-                }
-                _ => None,
+                Some(_) => self.blob_text(delta.old_file().id())?,
+                None => None,
             };
             let new = match &new_path {
-                // The new side of `git diff` is the working tree itself.
-                Some(p) => std::fs::read(self.workdir.join(p))
+                Some(p) if self.spec.new_side_is_workdir() => std::fs::read(self.workdir.join(p))
                     .ok()
                     .map(|b| Text::from(String::from_utf8_lossy(&b).into_owned())),
+                Some(_) => self.blob_text(delta.new_file().id())?,
                 None => None,
             };
             (old, new)
@@ -137,7 +260,7 @@ mod tests {
             index.add_path(Path::new(name)).unwrap();
         }
         index.write().unwrap();
-        let local = LocalRepo::discover(dir.path()).unwrap();
+        let local = LocalRepo::discover(dir.path(), DiffSpec::WorkingTree).unwrap();
         (dir, local)
     }
 
@@ -146,7 +269,7 @@ mod tests {
         let (dir, repo) = repo_with(&[("a.txt", "one\ntwo\nthree\n")]);
         std::fs::write(dir.path().join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
 
-        let cs = repo.working_tree_diff(3).unwrap();
+        let cs = repo.diff(3).unwrap();
         assert_eq!(cs.files.len(), 1);
         let f = &cs.files[0];
         assert_eq!(f.status, FileStatus::Modified);
@@ -178,7 +301,7 @@ mod tests {
         let (dir, repo) = repo_with(&[("a.txt", "x\n"), ("b.txt", "y\n")]);
         std::fs::remove_file(dir.path().join("b.txt")).unwrap();
 
-        let cs = repo.working_tree_diff(3).unwrap();
+        let cs = repo.diff(3).unwrap();
         assert_eq!(cs.files.len(), 1);
         assert_eq!(cs.files[0].status, FileStatus::Deleted);
         assert_eq!(cs.files[0].new_path, None);
@@ -188,6 +311,88 @@ mod tests {
     #[test]
     fn clean_tree_is_empty() {
         let (_dir, repo) = repo_with(&[("a.txt", "x\n")]);
-        assert!(repo.working_tree_diff(3).unwrap().files.is_empty());
+        assert!(repo.diff(3).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn parses_specs_like_git_diff() {
+        let p = |a: Option<&str>, staged| DiffSpec::parse(a, staged).unwrap();
+        let s = |x: &str| x.to_owned();
+        assert_eq!(p(None, false), DiffSpec::WorkingTree);
+        assert_eq!(p(None, true), DiffSpec::Staged { base: None });
+        assert_eq!(p(Some("main"), true), DiffSpec::Staged { base: Some(s("main")) });
+        assert_eq!(p(Some("main"), false), DiffSpec::Rev(s("main")));
+        assert_eq!(p(Some("a..b"), false), DiffSpec::Range { from: s("a"), to: s("b") });
+        assert_eq!(p(Some("main.."), false), DiffSpec::Range { from: s("main"), to: s("HEAD") });
+        assert_eq!(p(Some("main..."), false), DiffSpec::MergeBase { from: s("main"), to: s("HEAD") });
+        assert_eq!(p(Some("...x"), false), DiffSpec::MergeBase { from: s("HEAD"), to: s("x") });
+        assert_eq!(p(Some("HEAD~2^!"), false), DiffSpec::Commit(s("HEAD~2")));
+        assert!(DiffSpec::parse(Some("a..b"), true).is_err());
+        assert!(DiffSpec::parse(Some(""), false).is_err());
+    }
+
+    /// Writes `files`, stages them and commits on HEAD; returns the commit id.
+    fn commit(dir: &Path, files: &[(&str, &str)], msg: &str) -> git2::Oid {
+        let repo = Repository::open(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+            index.add_path(Path::new(name)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let parent = repo.head().ok().map(|h| h.peel_to_commit().unwrap());
+        let parents: Vec<_> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents).unwrap()
+    }
+
+    fn summary(dir: &Path, spec: &str, staged: bool) -> Vec<(String, FileStatus, String)> {
+        let repo = LocalRepo::discover(dir, DiffSpec::parse(Some(spec), staged).unwrap()).unwrap();
+        repo.diff(3)
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| {
+                let new = f.content(Side::New).map(|t| t.as_str().to_owned()).unwrap_or_default();
+                (f.path().display().to_string(), f.status, new)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn revision_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        Repository::init(d).unwrap();
+        let root = commit(d, &[("a.txt", "1\n")], "root");
+        commit(d, &[("a.txt", "2\n"), ("b.txt", "b\n")], "second");
+        // Uncommitted change: visible only when the new side is the working tree.
+        std::fs::write(d.join("a.txt"), "3\n").unwrap();
+
+        let m = FileStatus::Modified;
+        let a = FileStatus::Added;
+        let e = |p: &str, st, t: &str| (p.to_owned(), st, t.to_owned());
+        let root = root.to_string();
+        assert_eq!(summary(d, &format!("{root}..HEAD"), false), [e("a.txt", m, "2\n"), e("b.txt", a, "b\n")]);
+        assert_eq!(summary(d, &format!("{root}..."), false), [e("a.txt", m, "2\n"), e("b.txt", a, "b\n")]);
+        assert_eq!(summary(d, &root, false), [e("a.txt", m, "3\n"), e("b.txt", a, "b\n")]);
+        assert_eq!(summary(d, "HEAD^!", false), [e("a.txt", m, "2\n"), e("b.txt", a, "b\n")]);
+        // Root commit: everything is added.
+        assert_eq!(summary(d, &format!("{root}^!"), false), [e("a.txt", a, "1\n")]);
+        assert!(summary(d, "HEAD", true).is_empty());
+        let repo = LocalRepo::discover(d, DiffSpec::parse(Some("nope"), false).unwrap()).unwrap();
+        let err = repo.diff(3).unwrap_err().to_string();
+        assert!(err.contains("unknown revision"), "{err}");
+    }
+
+    #[test]
+    fn staged_before_first_commit() {
+        let (_dir, repo) = repo_with(&[("a.txt", "x\n")]);
+        let repo = LocalRepo::discover(repo.workdir(), DiffSpec::Staged { base: None }).unwrap();
+        let cs = repo.diff(3).unwrap();
+        assert_eq!(cs.files.len(), 1);
+        assert_eq!(cs.files[0].status, FileStatus::Added);
+        assert_eq!(cs.files[0].content(Side::New).unwrap().as_str(), "x\n");
     }
 }

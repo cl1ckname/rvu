@@ -5,6 +5,11 @@ GitLab, комментарии прямо на просматриваемой с
 
 ```sh
 rvu                                   # ревью `git diff` в текущем репозитории
+rvu --staged                          # то, что в индексе (`git diff --staged`)
+rvu main                              # рабочее дерево против main (`git diff main`)
+rvu main...                           # только изменения ветки относительно main
+rvu main..feature                     # между двумя ревизиями
+rvu abc123^!                          # один коммит
 rvu https://gitlab.example.com/group/project/-/merge_requests/42
 ```
 

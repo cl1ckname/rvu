@@ -69,7 +69,7 @@ impl Action {
             Self::FocusTree => "focus files",
             Self::FocusDiff => "focus diff",
             Self::Open => "open file / toggle directory",
-            Self::Close => "collapse directory / go to parent",
+            Self::Close => "collapse dir / parent / collapse all",
             Self::Refresh => "reload changes",
         }
     }

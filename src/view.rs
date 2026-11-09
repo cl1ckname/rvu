@@ -499,7 +499,7 @@ mod tests {
             index.add_path(std::path::Path::new("f.txt")).unwrap();
             index.write().unwrap();
             std::fs::write(dir.path().join("f.txt"), new).unwrap();
-            let cs = LocalRepo::discover(dir.path()).unwrap().working_tree_diff(context).unwrap();
+            let cs = LocalRepo::discover(dir.path(), crate::source::local::DiffSpec::WorkingTree).unwrap().diff(context).unwrap();
             (dir, cs)
         }
 

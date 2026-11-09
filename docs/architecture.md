@@ -25,7 +25,7 @@ src/
 ├── logging.rs       // tracing → файл
 ├── model.rs         // Changeset, FileDiff, Hunk, DiffLine, Side
 ├── source/
-│   ├── local.rs     // git2: рабочее дерево ↔ индекс (позже ветки/коммиты)
+│   ├── local.rs     // git2: дифф по аргументам как у `git diff` (DiffSpec)
 │   ├── gitlab.rs    // MR через API → Changeset; запросы полных версий файлов
 │   └── unidiff.rs   // парсер unified diff (поле `diff` в ответе GitLab)
 ├── gitlab/          // HTTP-клиент GitLab (reqwest): типы API, пагинация, разбор URL MR
